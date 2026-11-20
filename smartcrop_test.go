@@ -51,10 +51,6 @@ func smartCrop(img image.Image, width, height int) (image.Rectangle, error) {
 	return analyzer.FindBestCrop(img, width, height)
 }
 
-type SubImager interface {
-	SubImage(r image.Rectangle) image.Image
-}
-
 func TestCrop(t *testing.T) {
 	fi, _ := os.Open(testFile)
 	defer fi.Close()
@@ -115,7 +111,7 @@ func BenchmarkEdge(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	rgbaImg := toRGBA(img)
+	rgbaImg := toZeroOriginRGBA(img)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		o := image.NewRGBA(img.Bounds())

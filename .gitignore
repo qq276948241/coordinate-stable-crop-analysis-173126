@@ -4,3 +4,7 @@
 *.key
 *credentials*
 .DS_Store
+
+# Debug/crop outputs produced by the tests and the debug logger.
+smartcrop.jpg
+smartcrop_*.png

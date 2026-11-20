@@ -64,6 +64,65 @@ func main() {
 
 Also see the test cases in smartcrop_test.go and cli application in cmd/smartcrop/ for further working examples.
 
+## Configurable analysis
+
+`FindBestCrop` keeps its original signature and behavior. For configurable
+analysis scale, target ratio and scoring weights use `NewSettingsAnalyzer`
+together with a `Settings` value. Unset fields fall back to the package
+defaults through `DefaultSettings()`, so a `Settings` value only needs the
+fields it wants to change.
+
+```go
+analyzer := smartcrop.NewSettingsAnalyzer(nfnt.NewDefaultResizer())
+
+settings := smartcrop.DefaultSettings()
+settings.TargetWidth, settings.TargetHeight = 300, 150
+// Analyze at a fixed scale instead of the automatic PrescaleMin rule.
+settings.AnalysisScale = 0.5
+// Callers can pin every scoring parameter, making runs fully reproducible.
+settings.SkinWeight = smartcrop.DefaultSkinWeight
+
+rect, err := analyzer.FindBestCropWithSettings(img, settings)
+```
+
+The analysis window is mapped back into the source image's own coordinate
+system, including images with non-zero bounds. When only one target dimension
+is supplied the other is derived from the source aspect ratio using the same
+chop (floor) rounding as the rest of the pipeline.
+
+## Applying a crop
+
+`CropImage` is the reusable cropping entry point. It validates that the
+rectangle is canonical, has positive area and lies inside `img.Bounds()`, then
+returns the sub-image without modifying the source. `CropImageToSize`
+additionally resizes the result to an exact output size.
+
+```go
+cropped, err := smartcrop.CropImage(img, rect)
+resized, err := smartcrop.CropImageToSize(img, rect, 300, 150, resizer)
+```
+
+`ScoreCrop` exposes the skin, saturation and edge scoring on an
+original-resolution image, so a window selected at analysis scale can be
+verified against a direct full-size score.
+
+## Error semantics
+
+The analyzer returns stable sentinel errors instead of uninitialized or
+out-of-bounds rectangles:
+
+* `ErrInvalidDimensions` — negative dimensions or both width and height zero
+* `ErrEmptyImage` — source image has no pixels
+* `ErrTargetTooLarge` — requested crop does not fit the source bounds
+* `ErrZeroSizeAnalysis` — the analysis scale collapses the image to zero size
+* `ErrNoCropCandidate` — no legal positive-area candidate window exists
+* `ErrCropOutOfBounds` — a crop rectangle escapes the source bounds
+* `ErrNilResizer` — a resizing entry point received a nil resizer
+
+All scoring paths are finite: solid black, solid color, transparent and
+border-hugging subjects never produce NaN, and repeated or concurrent calls
+with the same image and `Settings` return identical rectangles.
+
 ## Simple CLI application
 
     go install github.com/muesli/smartcrop/cmd/smartcrop

@@ -32,7 +32,6 @@ Jonas Wagner's smartcrop.js https://github.com/jwagner/smartcrop.js
 package smartcrop
 
 import (
-	"errors"
 	"image"
 	"image/color"
 	"io/ioutil"
@@ -46,51 +45,37 @@ import (
 )
 
 var (
-	// ErrInvalidDimensions gets returned when the supplied dimensions are invalid
-	ErrInvalidDimensions = errors.New("Expect either a height or width")
-
 	skinColor = [3]float64{0.78, 0.57, 0.44}
+
+	// floatEpsilon guards the candidate loops against floating point drift at
+	// the image border.
+	floatEpsilon = 1e-9
 )
 
-const (
-	detailWeight            = 0.2
-	skinBias                = 0.01
-	skinBrightnessMin       = 0.2
-	skinBrightnessMax       = 1.0
-	skinThreshold           = 0.8
-	skinWeight              = 1.8
-	saturationBrightnessMin = 0.05
-	saturationBrightnessMax = 0.9
-	saturationThreshold     = 0.4
-	saturationBias          = 0.2
-	saturationWeight        = 0.3
-	scoreDownSample         = 8 // step * minscale rounded down to the next power of two should be good
-	step                    = 8
-	scaleStep               = 0.1
-	minScale                = 0.9
-	maxScale                = 1.0
-	edgeRadius              = 0.4
-	edgeWeight              = -20.0
-	outsideImportance       = -0.5
-	ruleOfThirds            = true
-	prescale                = true
-	prescaleMin             = 400.00
-)
-
-// Analyzer interface analyzes its struct and returns the best possible crop with the given
-// width and height returns an error if invalid
+// Analyzer analyzes an image and returns the best possible crop with the given
+// width and height. An error is returned for invalid dimensions or empty
+// images.
 type Analyzer interface {
 	FindBestCrop(img image.Image, width, height int) (image.Rectangle, error)
 }
 
-// Score contains values that classify matches
+// SettingsAnalyzer is the configurable counterpart of Analyzer. The supplied
+// Settings fully determine the result, so repeated and concurrent calls with
+// the same image and Settings return identical rectangles.
+type SettingsAnalyzer interface {
+	FindBestCropWithSettings(img image.Image, s Settings) (image.Rectangle, error)
+}
+
+// Score contains the independently verifiable contributions of a candidate
+// crop. All fields are plain accumulations and are finite even for solid black,
+// solid color or fully transparent images.
 type Score struct {
 	Detail     float64
 	Saturation float64
 	Skin       float64
 }
 
-// Crop contains results
+// Crop contains a candidate rectangle together with its Score.
 type Crop struct {
 	image.Rectangle
 	Score Score
@@ -124,59 +109,209 @@ func NewAnalyzerWithLogger(resizer options.Resizer, logger Logger) Analyzer {
 	return &smartcropAnalyzer{Resizer: resizer, logger: logger}
 }
 
+// NewSettingsAnalyzer returns a configurable analyzer using the given Resizer.
+func NewSettingsAnalyzer(resizer options.Resizer) SettingsAnalyzer {
+	return NewSettingsAnalyzerWithLogger(resizer, Logger{})
+}
+
+// NewSettingsAnalyzerWithLogger returns a configurable analyzer with the given
+// Resizer and Logger.
+func NewSettingsAnalyzerWithLogger(resizer options.Resizer, logger Logger) SettingsAnalyzer {
+	if logger.Log == nil {
+		logger.Log = log.New(ioutil.Discard, "", 0)
+	}
+	return &smartcropAnalyzer{Resizer: resizer, logger: logger}
+}
+
+// FindBestCrop keeps the historical entry point and its behavior. It delegates
+// to FindBestCropWithSettings using the default settings and the requested
+// target dimensions.
 func (o smartcropAnalyzer) FindBestCrop(img image.Image, width, height int) (image.Rectangle, error) {
-	if width == 0 && height == 0 {
-		return image.Rectangle{}, ErrInvalidDimensions
+	s := DefaultSettings()
+	s.TargetWidth = width
+	s.TargetHeight = height
+	return o.FindBestCropWithSettings(img, s)
+}
+
+// FindBestCropWithSettings runs the content aware analysis described by s and
+// maps the winning analysis window back into the source image's coordinate
+// system. It never mutates img and always either returns a positive-area
+// rectangle contained in img.Bounds() or one of the package's stable errors.
+func (o smartcropAnalyzer) FindBestCropWithSettings(img image.Image, s Settings) (image.Rectangle, error) {
+	s = s.withDefaults()
+
+	srcBounds := img.Bounds()
+	if srcBounds.Dx() <= 0 || srcBounds.Dy() <= 0 {
+		return image.Rectangle{}, ErrEmptyImage
 	}
 
-	// resize image for faster processing
-	scale := math.Min(float64(img.Bounds().Dx())/float64(width), float64(img.Bounds().Dy())/float64(height))
-	var lowimg *image.RGBA
-	var prescalefactor = 1.0
+	targetW, targetH, err := resolveTarget(s, srcBounds)
+	if err != nil {
+		return image.Rectangle{}, err
+	}
 
-	if prescale {
-		// if f := 1.0 / scale / minScale; f < 1.0 {
-		// prescalefactor = f
-		// }
-		if f := prescaleMin / math.Min(float64(img.Bounds().Dx()), float64(img.Bounds().Dy())); f < 1.0 {
-			prescalefactor = f
+	// fitScale is the ratio between the source image and the requested crop
+	// window. It is always >= 1 because targets larger than the source are
+	// rejected above.
+	fitScale := math.Min(
+		float64(srcBounds.Dx())/float64(targetW),
+		float64(srcBounds.Dy())/float64(targetH))
+
+	// Determine the ratio between analysis pixels and source pixels. An
+	// explicit AnalysisScale wins; otherwise the legacy PrescaleMin rule is
+	// used while prescaling is enabled.
+	analysisScale := 1.0
+	switch {
+	case s.AnalysisScale > 0:
+		analysisScale = s.AnalysisScale
+	case s.Prescale:
+		if f := s.PrescaleMin / math.Min(float64(srcBounds.Dx()), float64(srcBounds.Dy())); f < 1.0 {
+			analysisScale = f
 		}
-		o.logger.Log.Println(prescalefactor)
-
-		smallimg := o.Resize(
-			img,
-			uint(float64(img.Bounds().Dx())*prescalefactor),
-			0)
-
-		lowimg = toRGBA(smallimg)
-	} else {
-		lowimg = toRGBA(img)
 	}
+
+	analysisW := int(chop(float64(srcBounds.Dx()) * analysisScale))
+	analysisH := int(chop(float64(srcBounds.Dy()) * analysisScale))
+	if analysisW <= 0 || analysisH <= 0 {
+		return image.Rectangle{}, ErrZeroSizeAnalysis
+	}
+
+	// Copy the source into an owned, zero-origin RGBA buffer so the caller's
+	// pixels are never modified. Resizing always allocates a fresh image; the
+	// copy additionally normalizes any non-zero source origin.
+	var lowimg *image.RGBA
+
+	// Keep the per-axis scales used to return analysis coordinates to the
+	// source. A resizer can round width and height differently, so a single
+	// shared factor would drift on extreme aspect ratios.
+	scaleX, scaleY := 1.0, 1.0
+	if analysisScale < 1.0-floatEpsilon {
+		resized := o.Resize(img, uint(analysisW), uint(analysisH))
+		lowimg = toZeroOriginRGBA(resized)
+		// The resizer is free to round the requested size; re-derive the
+		// effective scales from the buffer it actually produced.
+		if lowimg.Bounds().Dx() <= 0 || lowimg.Bounds().Dy() <= 0 {
+			return image.Rectangle{}, ErrZeroSizeAnalysis
+		}
+		scaleX = float64(lowimg.Bounds().Dx()) / float64(srcBounds.Dx())
+		scaleY = float64(lowimg.Bounds().Dy()) / float64(srcBounds.Dy())
+		analysisScale = scaleX
+	} else {
+		lowimg = toZeroOriginRGBA(img)
+	}
+
+	cropWidth := chop(float64(targetW) * fitScale * scaleX)
+	cropHeight := chop(float64(targetH) * fitScale * scaleY)
+	if cropWidth <= 0 || cropHeight <= 0 {
+		return image.Rectangle{}, ErrNoCropCandidate
+	}
+	realMinScale := math.Min(s.MaxScale, math.Max(1.0/fitScale, s.MinScale))
+
+	o.logger.Log.Printf("original resolution: %dx%d\n", srcBounds.Dx(), srcBounds.Dy())
+	o.logger.Log.Printf("analysis scale: x=%f y=%f, cropw: %f, croph: %f, minscale: %f\n",
+		scaleX, scaleY, cropWidth, cropHeight, realMinScale)
 
 	if o.logger.DebugMode {
 		_ = writeImage("png", lowimg, "./smartcrop_prescale.png")
 	}
 
-	cropWidth, cropHeight := chop(float64(width)*scale*prescalefactor), chop(float64(height)*scale*prescalefactor)
-	realMinScale := math.Min(maxScale, math.Max(1.0/scale, minScale))
-
-	o.logger.Log.Printf("original resolution: %dx%d\n", img.Bounds().Dx(), img.Bounds().Dy())
-	o.logger.Log.Printf("scale: %f, cropw: %f, croph: %f, minscale: %f\n", scale, cropWidth, cropHeight, realMinScale)
-
-	topCrop := analyse(o.logger, lowimg, cropWidth, cropHeight, realMinScale)
-
-	if prescale == true {
-		topCrop.Min.X = int(chop(float64(topCrop.Min.X) / prescalefactor))
-		topCrop.Min.Y = int(chop(float64(topCrop.Min.Y) / prescalefactor))
-		topCrop.Max.X = int(chop(float64(topCrop.Max.X) / prescalefactor))
-		topCrop.Max.Y = int(chop(float64(topCrop.Max.Y) / prescalefactor))
+	analysisCrop, err := analyse(o.logger, lowimg, s, cropWidth, cropHeight, realMinScale)
+	if err != nil {
+		return image.Rectangle{}, err
 	}
+
+	topCrop := mapToSource(analysisCrop, srcBounds, scaleX, scaleY)
 
 	return topCrop.Canon(), nil
 }
 
-func (c Crop) totalScore() float64 {
-	return (c.Score.Detail*detailWeight + c.Score.Skin*skinWeight + c.Score.Saturation*saturationWeight) / float64(c.Dx()) / float64(c.Dy())
+// resolveTarget validates the requested dimensions and derives a missing side
+// from the source aspect ratio.
+func resolveTarget(s Settings, b image.Rectangle) (int, int, error) {
+	w := s.TargetWidth
+	h := s.TargetHeight
+
+	if w < 0 || h < 0 || (w == 0 && h == 0) {
+		return 0, 0, ErrInvalidDimensions
+	}
+
+	switch {
+	case w == 0:
+		// Preserve the source aspect ratio and apply the same chop rounding
+		// the rest of the pipeline uses.
+		w = int(chop(float64(h) * float64(b.Dx()) / float64(b.Dy())))
+		if w <= 0 {
+			return 0, 0, ErrInvalidDimensions
+		}
+	case h == 0:
+		h = int(chop(float64(w) * float64(b.Dy()) / float64(b.Dx())))
+		if h <= 0 {
+			return 0, 0, ErrInvalidDimensions
+		}
+	}
+
+	if w > b.Dx() || h > b.Dy() {
+		return 0, 0, ErrTargetTooLarge
+	}
+
+	return w, h, nil
+}
+
+// mapToSource converts a zero-origin analysis rectangle back into the source
+// image's coordinate system. Min points use floor rounding toward the inside
+// and Max points use ceil rounding toward the outside, which guarantees the
+// mapped window fully contains the analysis window. Per-axis scales avoid
+// drift when the resizer rounds width and height differently. The result is
+// clamped to the source bounds and is guaranteed to have positive width and
+// height.
+func mapToSource(crop image.Rectangle, srcBounds image.Rectangle, scaleX, scaleY float64) image.Rectangle {
+	invX := 1.0 / scaleX
+	invY := 1.0 / scaleY
+
+	minX := srcBounds.Min.X + int(math.Floor(float64(crop.Min.X)*invX))
+	minY := srcBounds.Min.Y + int(math.Floor(float64(crop.Min.Y)*invY))
+	maxX := srcBounds.Min.X + int(math.Ceil(float64(crop.Max.X)*invX))
+	maxY := srcBounds.Min.Y + int(math.Ceil(float64(crop.Max.Y)*invY))
+
+	rect := image.Rect(minX, minY, maxX, maxY)
+
+	// Defensive clamping: a legal analysis rectangle must always map inside
+	// the source bounds, but this keeps rounding surprises from escaping.
+	if rect.Min.X < srcBounds.Min.X {
+		rect.Min.X = srcBounds.Min.X
+	}
+	if rect.Min.Y < srcBounds.Min.Y {
+		rect.Min.Y = srcBounds.Min.Y
+	}
+	if rect.Max.X > srcBounds.Max.X {
+		rect.Max.X = srcBounds.Max.X
+	}
+	if rect.Max.Y > srcBounds.Max.Y {
+		rect.Max.Y = srcBounds.Max.Y
+	}
+	if rect.Max.X <= rect.Min.X {
+		rect.Max.X = rect.Min.X + 1
+	}
+	if rect.Max.Y <= rect.Min.Y {
+		rect.Max.Y = rect.Min.Y + 1
+	}
+	if rect.Max.X > srcBounds.Max.X || rect.Max.Y > srcBounds.Max.Y {
+		// Can only happen on degenerate one-pixel sources.
+		rect = image.Rect(srcBounds.Min.X, srcBounds.Min.Y,
+			srcBounds.Min.X+1, srcBounds.Min.Y+1)
+	}
+
+	return rect
+}
+
+// totalScore combines the weighted, area-normalized contributions. The formula
+// matches the original implementation so existing crops stay reproducible.
+func (c Crop) totalScore(s Settings) float64 {
+	area := float64(c.Dx()) * float64(c.Dy())
+	if area == 0 {
+		return 0
+	}
+	return (c.Score.Detail*s.DetailWeight + c.Score.Skin*s.SkinWeight + c.Score.Saturation*s.SaturationWeight) / area
 }
 
 func chop(x float64) float64 {
@@ -195,9 +330,11 @@ func bounds(l float64) float64 {
 	return math.Min(math.Max(l, 0.0), 255)
 }
 
-func importance(crop Crop, x, y int) float64 {
+// importance returns the spatial importance of pixel (x, y) relative to crop.
+// Every branch is finite for positive-area crops.
+func importance(s Settings, crop Crop, x, y int) float64 {
 	if crop.Min.X > x || x >= crop.Max.X || crop.Min.Y > y || y >= crop.Max.Y {
-		return outsideImportance
+		return s.OutsideImportance
 	}
 
 	xf := float64(x-crop.Min.X) / float64(crop.Dx())
@@ -206,46 +343,59 @@ func importance(crop Crop, x, y int) float64 {
 	px := math.Abs(0.5-xf) * 2.0
 	py := math.Abs(0.5-yf) * 2.0
 
-	dx := math.Max(px-1.0+edgeRadius, 0.0)
-	dy := math.Max(py-1.0+edgeRadius, 0.0)
-	d := (dx*dx + dy*dy) * edgeWeight
+	dx := math.Max(px-1.0+s.EdgeRadius, 0.0)
+	dy := math.Max(py-1.0+s.EdgeRadius, 0.0)
+	d := (dx*dx + dy*dy) * s.EdgeWeight
 
-	s := 1.41 - math.Sqrt(px*px+py*py)
-	if ruleOfThirds {
-		s += (math.Max(0.0, s+d+0.5) * 1.2) * (thirds(px) + thirds(py))
+	v := 1.41 - math.Sqrt(px*px+py*py)
+	if s.RuleOfThirds {
+		v += (math.Max(0.0, v+d+0.5) * 1.2) * (thirds(px) + thirds(py))
 	}
 
-	return s + d
+	return v + d
 }
 
-func score(output *image.RGBA, crop Crop) Score {
+// score accumulates the skin, detail and saturation contributions of one crop.
+// It is deterministic: pixels are visited in row-major order and every
+// intermediate value is finite, including on black, solid and transparent
+// images.
+func score(s Settings, output *image.RGBA, crop Crop) Score {
 	width := output.Bounds().Dx()
 	height := output.Bounds().Dy()
-	score := Score{}
+	result := Score{}
 
-	// same loops but with downsampling
-	//for y := 0; y < height; y++ {
-	//for x := 0; x < width; x++ {
-	for y := 0; y <= height-scoreDownSample; y += scoreDownSample {
-		for x := 0; x <= width-scoreDownSample; x += scoreDownSample {
+	step := s.ScoreDownSample
+	maxX := width - step
+	maxY := height - step
+	if maxX < 0 || maxY < 0 {
+		// Image smaller than the sampling stride: no legal sample position,
+		// return a well-defined zero score instead of looping on negatives.
+		return result
+	}
+
+	for y := 0; y <= maxY; y += step {
+		for x := 0; x <= maxX; x += step {
 			c := output.RGBAAt(x, y)
 			r8 := float64(c.R)
 			g8 := float64(c.G)
 			b8 := float64(c.B)
 
-			imp := importance(crop, x, y)
+			imp := importance(s, crop, x, y)
 			det := g8 / 255.0
 
-			score.Skin += r8 / 255.0 * (det + skinBias) * imp
-			score.Detail += det * imp
-			score.Saturation += b8 / 255.0 * (det + saturationBias) * imp
+			result.Skin += r8 / 255.0 * (det + s.SkinBias) * imp
+			result.Detail += det * imp
+			result.Saturation += b8 / 255.0 * (det + s.SaturationBias) * imp
 		}
 	}
 
-	return score
+	return result
 }
 
-func analyse(logger Logger, img *image.RGBA, cropWidth, cropHeight, realMinScale float64) image.Rectangle {
+// analyse runs the detectors and returns the highest scoring candidate. The
+// winner is selected with an order-independent tie breaker so the loop
+// enumeration can never change the result.
+func analyse(logger Logger, img *image.RGBA, s Settings, cropWidth, cropHeight, realMinScale float64) (image.Rectangle, error) {
 	o := image.NewRGBA(img.Bounds())
 
 	now := time.Now()
@@ -254,39 +404,60 @@ func analyse(logger Logger, img *image.RGBA, cropWidth, cropHeight, realMinScale
 	debugOutput(logger.DebugMode, o, "edge")
 
 	now = time.Now()
-	skinDetect(img, o)
+	skinDetect(s, img, o)
 	logger.Log.Println("Time elapsed skin:", time.Since(now))
 	debugOutput(logger.DebugMode, o, "skin")
 
 	now = time.Now()
-	saturationDetect(img, o)
+	saturationDetect(s, img, o)
 	logger.Log.Println("Time elapsed sat:", time.Since(now))
 	debugOutput(logger.DebugMode, o, "saturation")
 
 	now = time.Now()
-	var topCrop Crop
-	topScore := -1.0
-	cs := crops(o, cropWidth, cropHeight, realMinScale)
+	cs := crops(s, o, cropWidth, cropHeight, realMinScale)
 	logger.Log.Println("Time elapsed crops:", time.Since(now), len(cs))
+	if len(cs) == 0 {
+		return image.Rectangle{}, ErrNoCropCandidate
+	}
 
 	now = time.Now()
-	for _, crop := range cs {
-		nowIn := time.Now()
-		crop.Score = score(o, crop)
-		logger.Log.Println("Time elapsed single-score:", time.Since(nowIn))
-		if crop.totalScore() > topScore {
-			topCrop = crop
-			topScore = crop.totalScore()
+	topIdx := 0
+	topScore := math.Inf(-1)
+	for i := range cs {
+		cs[i].Score = score(s, o, cs[i])
+		cur := cs[i].totalScore(s)
+		if betterCandidate(cur, cs[i], topScore, cs[topIdx]) {
+			topIdx = i
+			topScore = cur
 		}
 	}
 	logger.Log.Println("Time elapsed score:", time.Since(now))
 
+	topCrop := cs[topIdx]
 	if logger.DebugMode {
-		drawDebugCrop(topCrop, o)
+		drawDebugCrop(s, topCrop, o)
 		debugOutput(true, o, "final")
 	}
 
-	return topCrop.Rectangle
+	return topCrop.Rectangle, nil
+}
+
+// betterCandidate encodes the deterministic winner rule. A candidate wins on a
+// strictly larger total score; exact ties are resolved by area, then Min.Y and
+// Min.X, so reordering the candidate slice cannot change the outcome.
+func betterCandidate(curScore float64, cur Crop, bestScore float64, best Crop) bool {
+	if curScore != bestScore {
+		return curScore > bestScore
+	}
+	curArea := cur.Dx() * cur.Dy()
+	bestArea := best.Dx() * best.Dy()
+	if curArea != bestArea {
+		return curArea > bestArea
+	}
+	if cur.Min.Y != best.Min.Y {
+		return cur.Min.Y < best.Min.Y
+	}
+	return cur.Min.X < best.Min.X
 }
 
 func saturation(c color.RGBA) float64 {
@@ -330,10 +501,16 @@ func cie(c color.RGBA) float64 {
 	return 0.5126*float64(c.B) + 0.7152*float64(c.G) + 0.0722*float64(c.R)
 }
 
+// skinCol returns the normalized skin-color match. The magnitude guard keeps
+// black pixels (the transparent or solid-black case) from dividing by zero and
+// producing NaN.
 func skinCol(c color.RGBA) float64 {
 	r8, g8, b8 := float64(c.R), float64(c.G), float64(c.B)
 
 	mag := math.Sqrt(r8*r8 + g8*g8 + b8*b8)
+	if mag == 0 {
+		return 0
+	}
 	rd := r8/mag - skinColor[0]
 	gd := g8/mag - skinColor[1]
 	bd := b8/mag - skinColor[2]
@@ -366,7 +543,6 @@ func edgeDetect(i *image.RGBA, o *image.RGBA) {
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			if x == 0 || x >= width-1 || y == 0 || y >= height-1 {
-				//lightness = cie((*i).At(x, y))
 				lightness = 0
 			} else {
 				lightness = cies[y*width+x]*4.0 -
@@ -382,7 +558,7 @@ func edgeDetect(i *image.RGBA, o *image.RGBA) {
 	}
 }
 
-func skinDetect(i *image.RGBA, o *image.RGBA) {
+func skinDetect(s Settings, i *image.RGBA, o *image.RGBA) {
 	width := i.Bounds().Dx()
 	height := i.Bounds().Dy()
 
@@ -392,8 +568,8 @@ func skinDetect(i *image.RGBA, o *image.RGBA) {
 			skin := skinCol(i.RGBAAt(x, y))
 
 			c := o.RGBAAt(x, y)
-			if skin > skinThreshold && lightness >= skinBrightnessMin && lightness <= skinBrightnessMax {
-				r := (skin - skinThreshold) * (255.0 / (1.0 - skinThreshold))
+			if skin > s.SkinThreshold && lightness >= skinBrightnessMin && lightness <= skinBrightnessMax {
+				r := (skin - s.SkinThreshold) * (255.0 / (1.0 - s.SkinThreshold))
 				nc := color.RGBA{uint8(bounds(r)), c.G, c.B, 255}
 				o.SetRGBA(x, y, nc)
 			} else {
@@ -404,18 +580,18 @@ func skinDetect(i *image.RGBA, o *image.RGBA) {
 	}
 }
 
-func saturationDetect(i *image.RGBA, o *image.RGBA) {
+func saturationDetect(s Settings, i *image.RGBA, o *image.RGBA) {
 	width := i.Bounds().Dx()
 	height := i.Bounds().Dy()
 
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			lightness := cie(i.RGBAAt(x, y)) / 255.0
-			saturation := saturation(i.RGBAAt(x, y))
+			sat := saturation(i.RGBAAt(x, y))
 
 			c := o.RGBAAt(x, y)
-			if saturation > saturationThreshold && lightness >= saturationBrightnessMin && lightness <= saturationBrightnessMax {
-				b := (saturation - saturationThreshold) * (255.0 / (1.0 - saturationThreshold))
+			if sat > s.SaturationThreshold && lightness >= saturationBrightnessMin && lightness <= saturationBrightnessMax {
+				b := (sat - s.SaturationThreshold) * (255.0 / (1.0 - s.SaturationThreshold))
 				nc := color.RGBA{c.R, c.G, uint8(bounds(b)), 255}
 				o.SetRGBA(x, y, nc)
 			} else {
@@ -426,7 +602,11 @@ func saturationDetect(i *image.RGBA, o *image.RGBA) {
 	}
 }
 
-func crops(i image.Image, cropWidth, cropHeight, realMinScale float64) []Crop {
+// crops enumerates candidate windows in a fixed scale, y, x order. The loop
+// guards keep windows inside the analysis bounds even when floating point
+// drift lands a candidate exactly on the border, and every returned rectangle
+// has positive width and height.
+func crops(s Settings, i image.Image, cropWidth, cropHeight, realMinScale float64) []Crop {
 	res := []Crop{}
 	width := i.Bounds().Dx()
 	height := i.Bounds().Dy()
@@ -445,11 +625,25 @@ func crops(i image.Image, cropWidth, cropHeight, realMinScale float64) []Crop {
 		cropH = minDimension
 	}
 
-	for scale := maxScale; scale >= realMinScale; scale -= scaleStep {
-		for y := 0; float64(y)+cropH*scale <= float64(height); y += step {
-			for x := 0; float64(x)+cropW*scale <= float64(width); x += step {
+	for scale := s.MaxScale; scale >= realMinScale-floatEpsilon; scale -= s.ScaleStep {
+		w := cropW * scale
+		h := cropH * scale
+		intW := int(chop(w))
+		intH := int(chop(h))
+		if intW <= 0 || intH <= 0 || intW > width || intH > height {
+			continue
+		}
+
+		for y := 0; float64(y)+h <= float64(height)+floatEpsilon; y += s.Step {
+			if y+intH > height {
+				continue
+			}
+			for x := 0; float64(x)+w <= float64(width)+floatEpsilon; x += s.Step {
+				if x+intW > width {
+					continue
+				}
 				res = append(res, Crop{
-					Rectangle: image.Rect(x, y, x+int(cropW*scale), y+int(cropH*scale)),
+					Rectangle: image.Rect(x, y, x+intW, y+intH),
 				})
 			}
 		}
@@ -458,14 +652,14 @@ func crops(i image.Image, cropWidth, cropHeight, realMinScale float64) []Crop {
 	return res
 }
 
-// toRGBA converts an image.Image to an image.RGBA
-func toRGBA(img image.Image) *image.RGBA {
-	switch v := img.(type) {
-	case *image.RGBA:
-		return v
-	}
-
-	out := image.NewRGBA(img.Bounds())
-	draw.Copy(out, image.Pt(0, 0), img, img.Bounds(), draw.Src, nil)
+// toZeroOriginRGBA allocates a fresh, zero-origin RGBA buffer and copies img
+// into it. Always copying (instead of returning an *image.RGBA input as-is)
+// guarantees the caller's pixels are never mutated and that candidate
+// coordinates computed against Bounds().Dx/Dy line up with the pixel data even
+// when the source image has a non-zero Min point.
+func toZeroOriginRGBA(img image.Image) *image.RGBA {
+	b := img.Bounds()
+	out := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Copy(out, image.Pt(0, 0), img, b, draw.Src, nil)
 	return out
 }

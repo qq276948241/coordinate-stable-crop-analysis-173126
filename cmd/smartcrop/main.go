@@ -102,16 +102,27 @@ func crop(img image.Image, w, h int, resize bool) image.Image {
 	width, height := getCropDimensions(img, w, h)
 	resizer := nfnt.NewDefaultResizer()
 	analyzer := smartcrop.NewAnalyzer(resizer)
-	topCrop, _ := analyzer.FindBestCrop(img, width, height)
+	topCrop, err := analyzer.FindBestCrop(img, width, height)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "smartcrop analysis failed: %v\n", err)
+		os.Exit(1)
+	}
 
-	type SubImager interface {
-		SubImage(r image.Rectangle) image.Image
+	if !resize || (width == topCrop.Dx() && height == topCrop.Dy()) {
+		cropped, err := smartcrop.CropImage(img, topCrop)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "smartcrop failed: %v\n", err)
+			os.Exit(1)
+		}
+		return cropped
 	}
-	img = img.(SubImager).SubImage(topCrop)
-	if resize && (img.Bounds().Dx() != width || img.Bounds().Dy() != height) {
-		img = resizer.Resize(img, uint(width), uint(height))
+
+	cropped, err := smartcrop.CropImageToSize(img, topCrop, width, height, resizer)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "smartcrop failed: %v\n", err)
+		os.Exit(1)
 	}
-	return img
+	return cropped
 }
 
 func getCropDimensions(img image.Image, width, height int) (int, int) {
