@@ -82,7 +82,7 @@ func writeImageToPng(img image.Image, name string) error {
 	return png.Encode(fso, img)
 }
 
-func drawDebugCrop(topCrop Crop, o *image.RGBA) {
+func drawDebugCrop(topCrop Crop, o *image.RGBA, opts Options) {
 	width := o.Bounds().Dx()
 	height := o.Bounds().Dy()
 
@@ -93,7 +93,7 @@ func drawDebugCrop(topCrop Crop, o *image.RGBA) {
 			g8 := float64(g >> 8)
 			b8 := uint8(b >> 8)
 
-			imp := importance(topCrop, x, y)
+			imp := importanceOpts(topCrop.Rectangle, x, y, opts)
 
 			if imp > 0 {
 				g8 += imp * 32
